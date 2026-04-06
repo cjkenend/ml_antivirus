@@ -213,3 +213,4 @@ __marimo__/
 
 # Custom .gitignore now 
 data/*
+*.env
