@@ -11,6 +11,9 @@ import subprocess       # Needed for cvd -> json
 import re               # Needed for CVE Details
 from pathlib import Path 
 from dotenv import load_dotenv
+from urllib.parse import urlencode  # Needed for specific NIST URL making 
+from datetime import datetime, timedelta
+
 
 
 
@@ -22,11 +25,17 @@ load_dotenv()
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 NVD_API_KEY = os.getenv("NVD_API_KEY", "")
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "data"))
+
 VX_LIMIT = int(os.getenv("VX_LIMIT", 200))
 VS_LIMIT = int(os.getenv("VS_LIMIT", 200))
+
 CVE_PAGES = int(os.getenv("CVE_PAGES", 5))
 CVE_RES_PER_PAGE = int(os.getenv("CVE_RES_PER_PAGE", 200))
 CVE_DETAILS_YEAR = int(os.getenv("CVE_DETAILS_YEAR", 2024))
+
+CVE_START_DATE = os.getenv("CVE_START_DATE", "2020-01-01")
+CVE_END_DATE = os.getenv("CVE_END_DATE", "2024-01-01")
+
 
 
 # Make sure the output dir exits 
@@ -181,42 +190,85 @@ def collect_cvd_nist() -> list[dict] | None:
     base = "https://services.nvd.nist.gov/rest/json/cves/2.0"
     all_cves = []
 
-    # Loop through pages 
-    for page in range(CVE_PAGES):
-        # Set the parameters and make a request 
-        nist_params = {"resultsPerPage": CVE_RES_PER_PAGE, "startIndex": page * CVE_RES_PER_PAGE}
-        resp = requests.get(base, headers=HEADERS_NVD, params=nist_params)
+    # Approved NIST Header 
+    nist_headers = {**HEADERS_NVD, "User-Agent": "curl/8.5.0"}
 
-        data = resp.json()
+    # NIST requirement -> API Calls with a time frame have 120 days only... Breaking up into chunks 
+    start = datetime.strptime(CVE_START_DATE, "%Y-%m-%d")
+    end = datetime.strptime(CVE_END_DATE,   "%Y-%m-%d")
+    delta = timedelta(days=119)
 
-        # Check status and pull data 
-        if resp.status_code != 200:
-            print(f"[NIST] API Failed with code: {resp.status_code}")
-            return None 
+    chunks = []
+    current = start 
+    while current < end:
+        chunk_end = min(current + delta, end)
+        chunks.append((current, chunk_end))
+        current = chunk_end + timedelta(days=1)
+
+    # Loop through request chunks 
+    for chunk_start, chunk_end in chunks:
+        # Make the start and end dates 
+        start_str = chunk_start.strftime("%Y-%m-%dT00:00:00.000")
+        end_str   = chunk_end.strftime("%Y-%m-%dT23:59:59.999")
+        page      = 0
+
+        # Now loop through pages 
+        while page < CVE_PAGES:
+            # Set the parameters and make a request 
+            url = (
+                f"{base}"
+                f"?pubStartDate={start_str}"
+                f"&pubEndDate={end_str}"
+                f"&resultsPerPage={CVE_RES_PER_PAGE}"
+                f"&startIndex={page * CVE_RES_PER_PAGE}"
+            )
+            resp = requests.get(url, headers=nist_headers)
+
+            # Debug
+            print(f"[NIST] Actual URL: {resp.url}")
+            print(f"[NIST] Status: {resp.status_code}")
+            print(f"[NIST] HEADERS_NVD value: {HEADERS_NVD}")
+
+            # Check status and pull data 
+            if resp.status_code != 200:
+                print(f"[NIST] API Failed with code: {resp.status_code}")
+                return None 
+            
+            # Pull data
+            data = resp.json()
+            vulns = data.get("vulnerabilities", [])
+            total = data.get("totalResults", 0)
+            
+            for item in vulns:
+                # Pull data from the item and put into JSON format 
+                cve = item.get("cve", {})
+                metrics = item.get("metrics", {})
+                cvss_v3 = metrics.get("cvssMetricV31", [{}])[0].get("cvssData", {})
+                cvss_v2 = metrics.get("cvssMetricV2",  [{}])[0].get("cvssData", {})
+
+
+                all_cves.append({
+                    "id":               cve.get("id"),
+                    "published":        cve.get("published"),
+                    "lastModified":     cve.get("lastModified"),
+                    "description":      next((d["value"] for d in cve.get("descriptions", []) if d["lang"] == "en"), ""),
+                    "cvss_v3_score":    cvss_v3.get("baseScore"),
+                    "cvss_v3_severity": cvss_v3.get("baseSeverity"),
+                    "cvss_v3_vector":   cvss_v3.get("vectorString"),
+                    "cvss_v2_score":    cvss_v2.get("baseScore"),
+                })
+            
+            # Check amount fetched and if we need to do another fetch depending on CVE_PAGES
+            fetched = (page * CVE_RES_PER_PAGE) + len(vulns)
+            print(f"[NIST] {start_str[:10]} to {end_str[:10]} | {fetched}/{total}")
+
+            if fetched >= total or not vulns:
+                break
+
+            # Need to add a delay also if no API key to meet up with the robots.txt time
+            page += 1
+            time.sleep(6.0 if not NVD_API_KEY else 0.6)
         
-        for item in data.get("vulnerabilities", []):
-            # Pull data from the item and put into JSON format 
-            cve = item.get("cve", {})
-            metrics = item.get("metrics", {})
-            cvss_v3 = metrics.get("cvssMetricV31", [{}])[0].get("cvssData", {})
-            cvss_v2 = metrics.get("cvssMetricV2",  [{}])[0].get("cvssData", {})
-
-
-            all_cves.append({
-                "id":               cve.get("id"),
-                "published":        cve.get("published"),
-                "lastModified":     cve.get("lastModified"),
-                "description":      next((d["value"] for d in cve.get("descriptions", []) if d["lang"] == "en"), ""),
-                "cvss_v3_score":    cvss_v3.get("baseScore"),
-                "cvss_v3_severity": cvss_v3.get("baseSeverity"),
-                "cvss_v3_vector":   cvss_v3.get("vectorString"),
-                "cvss_v2_score":    cvss_v2.get("baseScore"),
-            })
-
-        # Print results (need to add a delay also if no API key to meet up with the robots.txt time)
-        print(f"[CVE/NVD] Page {page+1}/{CVE_PAGES} — {len(data.get('vulnerabilities', []))} records")
-        time.sleep(6.0 if not NVD_API_KEY else 0.6)
-    
     # Save results now 
     out = OUTPUT_DIR / "cve_nvd.json"
     out.write_text(json.dumps(all_cves, indent=2))
@@ -267,7 +319,7 @@ if __name__ == "__main__":
     #print(vx_data)
 
         # ClamAV 
-    clam_data = collect_clamav_signatures()
+    #clam_data = collect_clamav_signatures()
     #print(clam_data)
     
 
