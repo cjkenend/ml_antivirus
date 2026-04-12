@@ -38,6 +38,8 @@ CVE_END_DATE = os.getenv("CVE_END_DATE", "2024-01-01")
 
 
 
+
+
 # Make sure the output dir exits 
 OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -229,6 +231,12 @@ def collect_cvd_nist() -> list[dict] | None:
             print(f"[NIST] Status: {resp.status_code}")
             print(f"[NIST] HEADERS_NVD value: {HEADERS_NVD}")
 
+            # Check if limit was hit 
+            if resp.status_code == 429:
+                print(f"[NIST] Rate limited — waiting 30 seconds...")
+                time.sleep(30)
+                resp = requests.get(url, headers=nist_headers)
+
             # Check status and pull data 
             if resp.status_code != 200:
                 print(f"[NIST] API Failed with code: {resp.status_code}")
@@ -240,9 +248,17 @@ def collect_cvd_nist() -> list[dict] | None:
             total = data.get("totalResults", 0)
             
             for item in vulns:
+                # Check formatting with first vuns 
+                if vulns and len(all_cves) == 0:
+                    first = vulns[0]
+                    cve_sample = first.get("cve", {})
+                    print(f"[NIST] Sample keys in item: {list(first.keys())}")
+                    print(f"[NIST] Sample keys in cve: {list(cve_sample.keys())}")
+                    print(f"[NIST] Sample metrics: {cve_sample.get('metrics', 'NOT FOUND')}")
+
                 # Pull data from the item and put into JSON format 
                 cve = item.get("cve", {})
-                metrics = item.get("metrics", {})
+                metrics = cve.get("metrics", {})
                 cvss_v3 = metrics.get("cvssMetricV31", [{}])[0].get("cvssData", {})
                 cvss_v2 = metrics.get("cvssMetricV2",  [{}])[0].get("cvssData", {})
 
@@ -267,13 +283,111 @@ def collect_cvd_nist() -> list[dict] | None:
 
             # Need to add a delay also if no API key to meet up with the robots.txt time
             page += 1
-            time.sleep(6.0 if not NVD_API_KEY else 0.6)
+            time.sleep(8.0 if not NVD_API_KEY else 0.6)
         
     # Save results now 
     out = OUTPUT_DIR / "cve_nvd.json"
     out.write_text(json.dumps(all_cves, indent=2))
     print(f"[CVE/NVD] Saved {len(all_cves)} CVEs → {out}")
     return all_cves
+
+def collect_benign_repos(benign_limit: int = 10000) -> list[dict]:
+    # Collect the random benging repos I was able to come across of various sources 
+    print("[Benign] Fetching benign source code file trees")
+
+    # Well known repos 
+    benign_repos = [
+        ("torvalds",    "linux",        "master"),
+        ("python",      "cpython",      "main"),
+        ("curl",        "curl",         "master"),
+        ("nginx",       "nginx",        "master"),
+        ("git",         "git",          "master"),
+        ("redis",       "redis",        "unstable"),
+        ("postgres",    "postgres",     "master"),
+        ("sqlite",      "sqlite",       "master"),
+        ("openssl",     "openssl",      "master"),
+        ("apache",      "httpd",        "trunk"),
+        ("microsoft", "vscode",        "main"),    
+        ("facebook",  "react",         "main"),     
+        ("golang",    "go",            "master"),
+        ("rust-lang", "rust",          "master"),   
+        ("kubernetes","kubernetes",    "master"),  
+        ("nodejs",    "node",          "main")
+    ]
+
+    all_records = []
+
+    # Loop through and pull 
+    for owner, repo, branch in benign_repos:
+        try:
+            print(f"[Benign] Fetching {owner}/{repo}")
+
+            # Fetch and go through limit 
+            files = fetch_github_files(owner, repo, branch=branch)
+            for f in files[:benign_limit]:
+                all_records.append({
+                    "source":   "benign_github",
+                    "repo":     f"{owner}/{repo}",
+                    "path":     f["path"],
+                    "size":     f.get("size",0),
+                    "sha":      f["sha"],
+                    "is_malware":   0,
+                    "url":      f"https://github.com/{owner}/{repo}/blob/{branch}/{f['path']}"
+                })
+            
+            print(f"[Benign] {owner}/{repo} — {min(len(files), benign_limit)} files indexed")
+
+            # Sleep to not get blocked
+            time.sleep(1.0)
+        
+        except Exception as e:
+            print(f"[Benign] Failed {owner}/{repo}: {e}")
+            continue
+    
+    # Save 
+    out = OUTPUT_DIR / "benign_github_index.json"
+    out.write_text(json.dumps(all_records, indent=2))
+    print(f"[Benign] Saved {len(all_records)} benign records → {out}")
+    return all_records
+
+# Collect sorel_benign (industry standard) not really needed
+# def collect_sorel_benign() -> list[dict]:
+#     # Industry standard benign malware to test on 
+#     print("[SOREL] Fetching SOREL-20M benign file index")
+
+#     # Repos to pull  
+#     sorel_repos = [
+#         ("sophos-ai", "SOREL-20M", "main")
+#     ]
+
+#     all_records = []
+
+#     # Fetch files 
+#     for owner, repo, branch in sorel_repos: 
+#         # Pull files 
+#         files = fetch_github_files(owner, repo, branch=branch)
+        
+#         # Filter to just metadata/index files, not the actual binaries
+#         meta_files = [f for f in files if f["path"].endswith((".json", ".csv", ".tsv", ".txt"))]
+        
+#         # Loop through and format data
+#         for f in meta_files:
+#             all_records.append({
+#                 "source":     "sorel20m",
+#                 "path":       f["path"],
+#                 "size":       f.get("size", 0),
+#                 "sha":        f["sha"],
+#                 "is_malware": 0,
+#                 "url":        f"https://github.com/{owner}/{repo}/blob/{branch}/{f['path']}"
+#             })
+#         print(f"[SOREL] Indexed {len(all_records)} metadata files")
+    
+#     # Save files
+#     out = OUTPUT_DIR / "sorel_benign_index.json"
+#     out.write_text(json.dumps(all_records, indent=2))
+#     print(f"[SOREL] Saved {len(all_records)} records → {out}")
+#     return all_records
+
 
 # Ended up not working, NISt should be enough but if more input data is needed then swap over to NIST
 # def collect_cvedetails() -> list[dict]:
@@ -328,9 +442,18 @@ if __name__ == "__main__":
     #print(vs_data)
 
         # NIST
-    nist_data = collect_cvd_nist()
+    #nist_data = collect_cvd_nist()
     #print(nist_data)
 
         # CVE Details 
     #cve_details = collect_cvedetails()
     #print(cve_details)
+
+
+    ########### Bengin Data ############
+    github_bengin = collect_benign_repos()
+    #print(github_bengin)
+
+    # Sorel data 
+    sorel_benign = collect_sorel_benign()
+    #print(sorel_benign)

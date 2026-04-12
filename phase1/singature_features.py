@@ -98,7 +98,7 @@ def build_signature_features() -> pd.DataFrame:
         # Pull the entries 
         entries = json.loads(Path(filepath).read_text())
         for entry in entries:
-            records.append(extract_signature_metadata(entry["path"], source, label))
+            records.append(extract_signature_meta(entry["path"], source, label))
         print(f"[build_signature_features] Loaded {len(entries)} entries from {source}")
 
     # Save entries - Probably add a check here that it's not empty
@@ -113,6 +113,7 @@ def build_signature_features() -> pd.DataFrame:
 
 
 if __name__ == "__main__":
+    #print(OUTPUT_DIR)
     df = build_signature_features()
     df.to_csv("data/signature_features.csv", index=False)
     print("[build_signature_features] Saved → data/signature_features.csv")
